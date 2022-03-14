@@ -1,0 +1,302 @@
+---
+title: "qmap_debias"
+author: "Gary Lynam"
+date: "14/03/2022"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r - Import data}
+library(tidync)
+library(dplyr)
+
+#Setting up directories and main variables
+sim_data_short="IPSL_ensmean" #shortname for GCM data
+sim_data="IPSL_CM6a_LR_h_ensmean" #longname for GCM data
+var="tas" #variable to debias
+box="box" #lonlat box
+
+#data directory
+dir <- sprintf("E:/PhD/CALDERA/01_data/02_gs_clim_data-master/data/raw_data/sim_data/IPSL_CM6a_LR_h_ensmean/%s",var)
+
+#debiased data directory
+dir_out <- sprintf("E:/PhD/CALDERA/01_data/02_gs_clim_data-master/data/raw_data/sim_data/%s_db/%s",sim_data,var)
+
+#image save directory
+g_dir <- sprintf("G:/My Drive/PhD/CALDERA/01_tambora_yield/02_analysis/01_data_validation/03_simulation_bias/qmap/%s/%s",sim_data_short,var)
+
+#directory to save qmap output
+qmap_dir <- sprintf("G:/My Drive/PhD/CALDERA/01_tambora_yield/02_analysis/01_data_validation/03_simulation_bias/qmap/")
+qfit_dir <- sprintf("%s/%s/%s",qmap_dir,sim_data_short,var)
+
+#Data files to use
+efile<-sprintf("%s/%s_ERA5-land_%s.nc",dir,var,box)
+ifile<-sprintf("%s/%s_day_IPSL-CM6A-LR_historical_ensmean_gr_19800101-20101231_%s.nc",dir,var,box)
+
+#Read in data
+
+era5 <- tidync(efile) %>% hyper_tibble() 
+ipsl <- tidync(ifile) %>% hyper_tibble()
+
+#era5 <- era5 %>% rename(lon = longitude,
+#                 lat = latitude)
+#ipsl<- ipsl  %>% rename(lon = longitude,
+#                 lat = latitude)
+
+#getting date info
+ipsl$date=  as.Date(ipsl$time, origin = "1850-01-01")
+drop <- c("time")
+ipsl = ipsl[,!(names(ipsl) %in% drop)]
+
+era5$date= as.POSIXct("1800-01-01 00:00")+as.difftime(era5$time,units="hours")
+
+era5$date = as.Date(era5$date)
+  as.Date(era5$time, origin = "1800-01-01  00:00")
+drop <- c("time")
+era5 = era5[,!(names(era5) %in% drop)]
+
+#merge data sets to mask ipsl sea values
+era_ipsl <- merge(era5, ipsl,by =c("lon","lat","date"), all.x=T)
+
+rm("era5", "ipsl")
+
+#create unique grid_id
+era_ipsl$grid_id <- cumsum(!duplicated(era_ipsl[1:2]))
+
+#create grid_id lon-lat directory
+grid_id <- era_ipsl %>% 
+  group_by(grid_id) %>% 
+  summarize(lon = max(lon),
+            lat = max(lat))
+
+#split dataset into obs and mod
+varx = sprintf("%s.x",var)
+vary = sprintf("%s.y",var)
+varlistx=c("grid_id",varx,"date")
+varlisty=c("grid_id",vary,"date")
+
+obs <- era_ipsl %>% dplyr::select(varlistx)
+mod <- era_ipsl %>% dplyr::select(varlisty)
+
+rm(era_ipsl)
+
+#convert obs mod into wide df for tasmax
+library(tidyr)
+
+obs_wide <- spread(obs,grid_id,varx)
+mod_wide <- spread(mod,grid_id,vary)
+
+```
+
+```{r - qmap objects}
+#----------------------------#
+####   Quantile mapping   ####
+#----------------------------#
+library(qmap)
+library(foreach)
+library(doParallel)
+library(dplyr)
+
+#setting parallel cores (using serial for monthly mapping for sequence order)
+numCores=6
+registerDoParallel(numCores) 
+
+###   Create data transform functions to map onto data
+###   The methods are as follows:
+### QM1: Linear transform function
+### QM2: Empirical quantile mapping 
+### QM3: Empirical robust quantile mapping (non-parametric) 
+### QM4: Normal distributional mapping 
+
+#process data for qmap
+rownames(obs_wide)=obs_wide[,1]
+drop <- c("date")
+obs_wide=obs_wide[,!(names(obs_wide) %in% drop)]
+
+rownames(mod_wide)=mod_wide[,1]
+drop <- c("date")
+mod_wide=mod_wide[,!(names(mod_wide) %in% drop)]
+
+
+### QM1: Linear transform function
+  
+  qm1_fit <- fitQmap(obs_wide,mod_wide,
+                     method = "PTF", transfun = "linear", 
+                     wet.day =FALSE, cost = "RSS")
+  
+  ### QM2: Empirical quantile mapping 
+  qm2_fit <- fitQmapQUANT(obs_wide,mod_wide,qstep = 0.01, 
+                          wet.day = FALSE)
+
+  ### QM3: Empirical robust quantile mapping (non-parametric) 
+  qm3_fit <- fitQmap(obs_wide,mod_wide,
+                     qstep = 0.01, method = "RQUANT", 
+                     wet.day = FALSE)
+  
+  ### QM4: Normal distributional mapping 
+  qm4_fit <- fitQmap(obs_wide,mod_wide,qstep = 0.01, 
+                     method = "DIST", dist = "norm",
+                     wet.day = FALSE, optim.method = "CG")
+
+save(qm1_fit,qm2_fit,qm3_fit,qm4_fit, file = sprintf("%s/fit_qmap/ymap/%s_qfit_%s.RData",g_dir,var,box))
+
+
+```
+
+```{r - qmap data}
+
+#getting transformed data
+  ### QM1: Linear transform function
+  qm1 <- doQmap(mod_wide,qm1_fit)
+  
+  ### QM2: Empirical quantile mapping 
+  qm2 <- doQmapQUANT(mod_wide,qm2_fit, wet.day = FALSE)
+  
+  ### QM3: Empirical robust quantile mapping (non-parametric) 
+  qm3 <- doQmap(mod_wide,qm3_fit,type="linear")
+  
+  ### QM4: Normal distributional mapping 
+  qm4 <- doQmap(mod_wide,qm4_fit)
+  
+rm(qm1_fit,qm2_fit,qm3_fit,qm4_fit)
+
+#reformat qmapped output to long
+library(reshape2)
+
+qm1$date <- rownames(qm1)
+qm1 <- qm1[,c(ncol(qm1),1:(ncol(qm1)-1))]
+qm1$date = as.Date(qm1$date)
+qm1 <- qm1[order(qm1$date),]
+qm1_long <- melt(qm1,id="date")
+names(qm1_long)[names(qm1_long) == "value"] <- sprintf("%s.qm1",var)
+names(qm1_long)[names(qm1_long) == "variable"] <- "grid_id"
+
+qm2$date <- rownames(qm2)
+qm2 <- qm2[,c(ncol(qm2),1:(ncol(qm2)-1))]
+qm2$date = as.Date(qm2$date)
+qm2 <- qm2[order(qm2$date),]
+qm2_long <- melt(qm2,id="date")
+names(qm2_long)[names(qm2_long) == "value"] <- sprintf("%s.qm2",var)
+names(qm2_long)[names(qm2_long) == "variable"] <- "grid_id"
+
+qm3$date <- rownames(qm3)
+qm3 <- qm3[,c(ncol(qm3),1:(ncol(qm3)-1))]
+qm3$date = as.Date(qm3$date)
+qm3 <- qm3[order(qm3$date),]
+qm3_long <- melt(qm3,id="date")
+names(qm3_long)[names(qm3_long) == "value"] <- sprintf("%s.qm3",var)
+names(qm3_long)[names(qm3_long) == "variable"] <- "grid_id"
+
+qm4$date <- rownames(qm4)
+qm4 <- qm4[,c(ncol(qm4),1:(ncol(qm4)-1))]
+qm4$date = as.Date(qm4$date)
+qm4 <- qm4[order(qm4$date),]
+qm4_long <- melt(qm4,id="date")
+names(qm4_long)[names(qm4_long) == "value"] <- sprintf("%s.qm4",var)
+names(qm4_long)[names(qm4_long) == "variable"] <- "grid_id"
+
+#Calulate absolute error between observation and model output + corrections
+mod$abs_error.mod <- abs(obs$tas.x - mod$tas.y)
+qm1_long$abs_error.qm1 <- abs(obs$tas.x - qm1_long$tas.qm1)
+qm2_long$abs_error.qm2 <- abs(obs$tas.x - qm2_long$tas.qm2)
+qm3_long$abs_error.qm3 <- abs(obs$tas.x - qm3_long$tas.qm3)
+qm4_long$abs_error.qm4 <- abs(obs$tas.x - qm4_long$tas.qm4)
+
+#drop wide data
+rm(qm1,qm2,qm3,qm4,obs_wide,mod_wide)
+
+save(mod,obs,grid_id,qm1_long,qm2_long,qm3_long,qm4_long, file = sprintf("%s/fit_qmap/ymap/%s_finaldata_%s.RData",g_dir,var,box))
+```
+
+### Exporting debiased data
+
+```{r - df2nc QM debiased data}
+#--------------------------------------#
+####    Exporting debiased data     ####
+#--------------------------------------#
+source(sprintf("%s/df2nc.R",qmap_dir))
+
+##Exporting QM1 fit
+ncfile=sprintf("%s/ymap/%s_day_IPSL-CM6A-LR_historical_ensmean_gr_1980-2010_b1_qm1_%s.nc",dir_out,var,box)
+
+#select only grid, time and variable and merge to get lonlat
+varf=sprintf("%s.qm1",var)
+varlistf=c("grid_id","date",varf)
+qm1_df <- merge(qm1_long %>% dplyr::select(varlistf), grid_id)
+
+#format date to time variable to be read by fxn
+colnames(qm1_df)[colnames(qm1_df) == 'date'] <- 'time'
+drop <- c("grid_id")
+qm1_df = qm1_df[,!(names(qm1_df) %in% drop)]
+qm1_df$time <- as.character(qm1_df$time)
+
+#write netcdf
+dataframe2netcdf(qm1_df,ncfile,overwrite_existing = TRUE)
+
+rm(qm1_df)
+
+##Exporting qm2 fit
+ncfile=sprintf("%s/ymap/%s_day_IPSL-CM6A-LR_historical_ensmean_gr_1980-2010_b1_qm2_%s.nc",dir_out,var,box)
+
+#select only grid, time and variable and merge to get lonlat
+varf=sprintf("%s.qm2",var)
+varlistf=c("grid_id","date",varf)
+qm2_df <- merge(qm2_long %>% dplyr::select(varlistf), grid_id)
+
+#format date to time variable to be read by fxn
+colnames(qm2_df)[colnames(qm2_df) == 'date'] <- 'time'
+drop <- c("grid_id")
+qm2_df = qm2_df[,!(names(qm2_df) %in% drop)]
+qm2_df$time <- as.character(qm2_df$time)
+
+#write netcdf
+dataframe2netcdf(qm2_df,ncfile,overwrite_existing = TRUE)
+
+rm(qm2_df)
+
+##Exporting qm3 fit
+ncfile=sprintf("%s/ymap/%s_day_IPSL-CM6A-LR_historical_ensmean_gr_1980-2010_b1_qm3_%s.nc",dir_out,var,box)
+
+#select only grid, time and variable and merge to get lonlat
+varf=sprintf("%s.qm3",var)
+varlistf=c("grid_id","date",varf)
+qm3_df <- merge(qm3_long %>% dplyr::select(varlistf), grid_id)
+
+#format date to time variable to be read by fxn
+colnames(qm3_df)[colnames(qm3_df) == 'date'] <- 'time'
+drop <- c("grid_id")
+qm3_df = qm3_df[,!(names(qm3_df) %in% drop)]
+qm3_df$time <- as.character(qm3_df$time)
+
+#write netcdf
+dataframe2netcdf(qm3_df,ncfile,overwrite_existing = TRUE)
+
+rm(qm3_df)
+
+##Exporting qm4 fit
+ncfile=sprintf("%s/ymap/%s_day_IPSL-CM6A-LR_historical_ensmean_gr_1980-2010_b1_qm4_%s.nc",dir_out,var,box)
+
+#select only grid, time and variable and merge to get lonlat
+varf=sprintf("%s.qm4",var)
+varlistf=c("grid_id","date",varf)
+qm4_df <- merge(qm4_long %>% dplyr::select(varlistf), grid_id)
+
+#format date to time variable to be read by fxn
+colnames(qm4_df)[colnames(qm4_df) == 'date'] <- 'time'
+drop <- c("grid_id")
+qm4_df = qm4_df[,!(names(qm4_df) %in% drop)]
+qm4_df$time <- as.character(qm4_df$time)
+
+#write netcdf
+dataframe2netcdf(qm4_df,ncfile,overwrite_existing = TRUE)
+
+rm(qm4_df)
+
+
+```
+
+
